@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import logging
 import math
 import random
@@ -16,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from stark_autoresearch.experiment import (
-    BASELINE_PARAMS,
     ExperimentConfig,
     ExperimentResult,
     perturb_config,
@@ -32,7 +32,27 @@ logger = logging.getLogger(__name__)
 # minutes per experiment). The surface has a global optimum that agents
 # must discover collaboratively.
 
-def _simulated_reward(params: dict[str, Any], noise_std: float = 0.015) -> float:
+def _derive_agent_seed(agent_id: str, seed: int | None) -> int | None:
+    """Derive a stable per-agent RNG seed from a shared run seed."""
+    if seed is None:
+        return None
+    seed_material = f"{seed}:{agent_id}".encode()
+    return int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+
+
+def _reward_fn_accepts_rng(reward_fn: Callable[..., float]) -> bool:
+    """Return True if the supplied reward function accepts an `rng` keyword."""
+    try:
+        return "rng" in inspect.signature(reward_fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _simulated_reward(
+    params: dict[str, Any],
+    noise_std: float = 0.015,
+    rng: random.Random | None = None,
+) -> float:
     """
     Simulated reward surface over the hyperparameter space.
 
@@ -42,6 +62,8 @@ def _simulated_reward(params: dict[str, Any], noise_std: float = 0.015) -> float
     - The surface is non-trivial (interactions between params)
     - Random noise simulates eval variance
     """
+    rng = rng or random
+
     lr = params.get("learning_rate", 5e-6)
     temp = params.get("temperature", 0.5)
     lora_r = params.get("lora_r", 4)
@@ -88,7 +110,7 @@ def _simulated_reward(params: dict[str, Any], noise_std: float = 0.015) -> float
 
     # Clamp to [0, 1] and add noise
     reward = max(0.0, min(1.0, base_reward))
-    reward += random.gauss(0, noise_std)
+    reward += rng.gauss(0, noise_std)
     return max(0.0, min(1.0, reward))
 
 
@@ -135,30 +157,36 @@ class AutoResearchAgent:
         self,
         agent_id: str | None = None,
         strategy: str = "adaptive",
-        reward_fn: Callable[[dict[str, Any]], float] | None = None,
+        reward_fn: Callable[..., float] | None = None,
+        seed: int | None = None,
     ) -> None:
         self.agent_id = agent_id or f"agent-{uuid.uuid4().hex[:8]}"
-        self.strategy = strategy  # "random", "adaptive", "exploit"
+        if strategy not in {"adaptive", "random", "exploit"}:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        self.strategy = strategy
+        self.seed = seed
         self.reward_fn = reward_fn or _simulated_reward
+        self._reward_accepts_rng = _reward_fn_accepts_rng(self.reward_fn)
         self.prover = MetricImprovementProver()
         self.memory = AgentMemory()
         self.best_reward: float = 0.0
         self.best_config: ExperimentConfig = ExperimentConfig.from_baseline()
-        self._rng = random.Random(hash(self.agent_id))
+        derived_seed = _derive_agent_seed(self.agent_id, seed)
+        self._rng = random.Random(derived_seed)
 
     def propose_experiment(self) -> ExperimentConfig:
         """Propose the next experiment based on strategy and learned memory."""
         if self.strategy == "random":
-            return perturb_config(self.best_config, num_params=3, magnitude=0.4)
+            return perturb_config(self.best_config, num_params=3, magnitude=0.4, rng=self._rng)
 
         if self.strategy == "exploit":
-            return perturb_config(self.best_config, num_params=1, magnitude=0.1)
+            return perturb_config(self.best_config, num_params=1, magnitude=0.1, rng=self._rng)
 
         # Adaptive: blend exploration and exploitation based on history.
         n = len(self.memory.experiments)
         if n < 3:
             # Early: explore broadly.
-            return perturb_config(self.best_config, num_params=3, magnitude=0.4)
+            return perturb_config(self.best_config, num_params=3, magnitude=0.4, rng=self._rng)
 
         # Compute improvement rate.
         n_improved = len(self.memory.improvements)
@@ -178,7 +206,7 @@ class AutoResearchAgent:
             num_params = 3
 
         # Bias toward parameter values that worked well.
-        config = perturb_config(self.best_config, num_params=num_params, magnitude=magnitude)
+        config = perturb_config(self.best_config, num_params=num_params, magnitude=magnitude, rng=self._rng)
         for key in list(config.params.keys()):
             best_val = self.memory.best_value_for(key)
             if best_val is not None and self._rng.random() < 0.3:
@@ -191,14 +219,17 @@ class AutoResearchAgent:
         self, config: ExperimentConfig
     ) -> ExperimentResult:
         """Run a single experiment and return the result."""
-        experiment_id = str(uuid.uuid4())
+        experiment_id = str(uuid.UUID(int=self._rng.getrandbits(128)))
         start = time.time()
 
         # Simulate training time (50-200ms for demo).
         await asyncio.sleep(self._rng.uniform(0.05, 0.2))
 
         # Compute reward.
-        reward = self.reward_fn(config.params)
+        if self._reward_accepts_rng:
+            reward = self.reward_fn(config.params, rng=self._rng)
+        else:
+            reward = self.reward_fn(config.params)
         elapsed = time.time() - start
 
         commit_hash = hashlib.sha256(
@@ -232,6 +263,7 @@ class AutoResearchAgent:
                 best_reward=self.best_reward,
                 experiment_id=result.experiment_id,
                 agent_id=self.agent_id,
+                config_hash=result.config.content_hash(),
             )
             return proof
         except ValueError:
@@ -277,12 +309,12 @@ class AutoResearchAgent:
             if proof:
                 accepted = await submit_fn(result, proof)
                 if accepted:
-                    self.best_reward = result.avg_reward
+                    self.best_reward = proof.new_reward
                     self.best_config = result.config
                     logger.info(
                         "[%s] Exp %d/%d: %.6f → PROVED & ACCEPTED (proof %d bytes, %dms)",
                         self.agent_id, i + 1, max_experiments,
-                        result.avg_reward, proof.proof_size, proof.proving_time_ms,
+                        proof.new_reward, proof.proof_size, proof.proving_time_ms,
                     )
                 else:
                     logger.info(

@@ -6,5 +6,6 @@ dist/
 build/
 .venv/
 *.so
+.pytest_cache/
 *.json
 !pyproject.toml

@@ -1,20 +1,10 @@
 """
 STARK proof generation and verification for metric improvement.
 
-Maps the autoresearch metric-improvement claim to the ves_stark compliance
-circuit:
-
-  1. Scale floating-point rewards to u64 integers (× SCALE_FACTOR).
-  2. Compute  delta = new_reward_scaled − best_reward_scaled.
-  3. Generate a STARK proof that  delta < SCALE_FACTOR  (i.e. the improvement
-     is a valid positive number less than 1.0 in original reward space).
-  4. If delta were negative (no improvement), it wraps to a huge u64 that
-     fails the STARK constraint — the proof cannot be generated.
-
-This means:
-  • A valid proof  ⟹  the metric genuinely improved.
-  • Verification is O(log n) — no re-running of the experiment.
-  • The exact new reward can remain private (only the improvement is proven).
+This module binds each proof to concrete experiment metadata, config hash,
+baseline reward, claimed new reward, and improvement delta. The STARK proves
+that the private improvement delta satisfies the threshold policy, while the
+payload amount binding ensures the proven witness matches the public claim.
 """
 
 from __future__ import annotations
@@ -26,18 +16,24 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-import ves_stark
+try:
+    import ves_stark
+except ImportError as exc:
+    raise ImportError(
+        "ves_stark is required. Run `python -m stark_autoresearch.environment` "
+        "for setup guidance, then install the bindings with `python scripts/install_ves_stark.py --stateset-stark-dir /path/to/stateset-stark`."
+    ) from exc
 
-# Rewards are in [0, 1] — scale to u64 for the STARK circuit.
+# Rewards are in [0, 1] for this demo. Scale them into u64 integers.
 SCALE_FACTOR = 1_000_000
 
 # Network identifiers (constant for this research network).
 NETWORK_TENANT_ID = str(uuid.UUID(int=0xABCDEF_0000_0001))
 NETWORK_STORE_ID = str(uuid.UUID(int=0xABCDEF_0000_0002))
 
-# Policy: we prove  improvement_delta < SCALE_FACTOR.
+# Policy: we prove improvement_delta < SCALE_FACTOR.
 POLICY_ID = "aml.threshold"
-POLICY_THRESHOLD = SCALE_FACTOR  # improvement must be in [0, 1.0)
+POLICY_THRESHOLD = SCALE_FACTOR
 
 
 @dataclass
@@ -46,24 +42,39 @@ class MetricImprovementProof:
 
     experiment_id: str
     agent_id: str
-    best_reward_scaled: int           # public: the baseline being beaten
-    proof_bytes: bytes                # the raw STARK proof
-    proof_hash: str                   # SHA-256 of proof_bytes
-    witness_commitment: list[int]     # 4 × u64 Rescue hash of the witness
-    witness_commitment_hex: str       # hex encoding of commitment
-    policy_hash: str                  # hash of the policy used
+    sequence_number: int
+    config_hash: str
+    best_reward_scaled: int
+    new_reward_scaled: int
+    improvement_delta_scaled: int
+    proof_bytes: bytes
+    proof_hash: str
+    witness_commitment: list[int]
+    witness_commitment_hex: str
+    policy_hash: str
+    amount_binding_hash: str
     proving_time_ms: int
     proof_size: int
     timestamp: float
+
+    @property
+    def new_reward(self) -> float:
+        """Canonical float reward implied by the proof metadata."""
+        return _scaled_to_reward(self.new_reward_scaled)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "experiment_id": self.experiment_id,
             "agent_id": self.agent_id,
+            "sequence_number": self.sequence_number,
+            "config_hash": self.config_hash,
             "best_reward_scaled": self.best_reward_scaled,
+            "new_reward_scaled": self.new_reward_scaled,
+            "improvement_delta_scaled": self.improvement_delta_scaled,
             "proof_hash": self.proof_hash,
             "witness_commitment_hex": self.witness_commitment_hex,
             "policy_hash": self.policy_hash,
+            "amount_binding_hash": self.amount_binding_hash,
             "proving_time_ms": self.proving_time_ms,
             "proof_size": self.proof_size,
             "timestamp": self.timestamp,
@@ -71,8 +82,45 @@ class MetricImprovementProof:
 
 
 def _reward_to_scaled(reward: float) -> int:
-    """Convert a [0,1] reward to a u64 for the STARK circuit."""
+    """Convert a reward to the circuit's scaled integer representation."""
     return max(0, int(round(reward * SCALE_FACTOR)))
+
+
+def _scaled_to_reward(scaled_reward: int) -> float:
+    """Convert a scaled reward back into the canonical float representation."""
+    return scaled_reward / SCALE_FACTOR
+
+
+def canonicalize_reward(reward: float) -> float:
+    """Round-trip a reward through the circuit scale factor."""
+    return _scaled_to_reward(_reward_to_scaled(reward))
+
+
+def _payload_hashes(
+    experiment_id: str,
+    agent_id: str,
+    config_hash: str,
+    best_reward_scaled: int,
+    new_reward_scaled: int,
+    improvement_delta_scaled: int,
+) -> tuple[str, str, str]:
+    """Derive deterministic hashes from the proof-bound experiment metadata."""
+    payload_data = json.dumps(
+        {
+            "agent_id": agent_id,
+            "best_reward_scaled": best_reward_scaled,
+            "config_hash": config_hash,
+            "experiment_id": experiment_id,
+            "improvement_delta_scaled": improvement_delta_scaled,
+            "new_reward_scaled": new_reward_scaled,
+            "type": "metric_improvement",
+        },
+        sort_keys=True,
+    ).encode()
+    payload_hash = hashlib.sha256(payload_data).hexdigest()
+    cipher_hash = hashlib.sha256(b"cipher:" + payload_data).hexdigest()
+    signing_hash = hashlib.sha256(b"sign:" + payload_data).hexdigest()
+    return payload_hash, cipher_hash, signing_hash
 
 
 def _make_public_inputs(
@@ -80,21 +128,27 @@ def _make_public_inputs(
     agent_id: str,
     sequence_number: int,
     policy_hash: str,
+    config_hash: str,
+    best_reward_scaled: int,
+    new_reward_scaled: int,
+    improvement_delta_scaled: int,
+    amount_binding_hash: str | None = None,
 ) -> ves_stark.CompliancePublicInputs:
     """Build CompliancePublicInputs for a metric-improvement proof."""
-    # Derive deterministic hashes from experiment metadata.
-    payload_data = json.dumps({
-        "experiment_id": experiment_id,
-        "agent_id": agent_id,
-        "type": "metric_improvement",
-    }, sort_keys=True).encode()
+    payload_hash, cipher_hash, signing_hash = _payload_hashes(
+        experiment_id=experiment_id,
+        agent_id=agent_id,
+        config_hash=config_hash,
+        best_reward_scaled=best_reward_scaled,
+        new_reward_scaled=new_reward_scaled,
+        improvement_delta_scaled=improvement_delta_scaled,
+    )
 
-    payload_hash = hashlib.sha256(payload_data).hexdigest()
-    cipher_hash = hashlib.sha256(b"cipher:" + payload_data).hexdigest()
-    signing_hash = hashlib.sha256(b"sign:" + payload_data).hexdigest()
-
-    # event_id derived from experiment_id
-    event_id = experiment_id if _is_valid_uuid(experiment_id) else str(uuid.uuid5(uuid.NAMESPACE_DNS, experiment_id))
+    event_id = (
+        experiment_id
+        if _is_valid_uuid(experiment_id)
+        else str(uuid.uuid5(uuid.NAMESPACE_DNS, experiment_id))
+    )
 
     return ves_stark.CompliancePublicInputs(
         event_id=event_id,
@@ -108,24 +162,58 @@ def _make_public_inputs(
         policy_id=POLICY_ID,
         policy_params={"threshold": POLICY_THRESHOLD},
         policy_hash=policy_hash,
+        amount_binding_hash=amount_binding_hash,
     )
 
 
-def _is_valid_uuid(s: str) -> bool:
+def _make_amount_bound_public_inputs(
+    experiment_id: str,
+    agent_id: str,
+    sequence_number: int,
+    policy_hash: str,
+    config_hash: str,
+    best_reward_scaled: int,
+    new_reward_scaled: int,
+    improvement_delta_scaled: int,
+) -> tuple[ves_stark.CompliancePublicInputs, dict[str, Any]]:
+    """Create public inputs and the canonical amount binding for the proof."""
+    base_inputs = _make_public_inputs(
+        experiment_id=experiment_id,
+        agent_id=agent_id,
+        sequence_number=sequence_number,
+        policy_hash=policy_hash,
+        config_hash=config_hash,
+        best_reward_scaled=best_reward_scaled,
+        new_reward_scaled=new_reward_scaled,
+        improvement_delta_scaled=improvement_delta_scaled,
+    )
+    amount_binding = ves_stark.create_payload_amount_binding(
+        base_inputs, improvement_delta_scaled
+    )
+    bound_inputs = _make_public_inputs(
+        experiment_id=experiment_id,
+        agent_id=agent_id,
+        sequence_number=sequence_number,
+        policy_hash=policy_hash,
+        config_hash=config_hash,
+        best_reward_scaled=best_reward_scaled,
+        new_reward_scaled=new_reward_scaled,
+        improvement_delta_scaled=improvement_delta_scaled,
+        amount_binding_hash=amount_binding["bindingHash"],
+    )
+    return bound_inputs, amount_binding
+
+
+def _is_valid_uuid(value: str) -> bool:
     try:
-        uuid.UUID(s)
+        uuid.UUID(value)
         return True
     except ValueError:
         return False
 
 
 class MetricImprovementProver:
-    """
-    Generates STARK proofs that a new metric exceeds the current best.
-
-    The proof circuit proves:  (new_reward - best_reward) * SCALE < THRESHOLD
-    which is only satisfiable when new_reward > best_reward.
-    """
+    """Generate STARK proofs that a new metric exceeds the current best."""
 
     def __init__(self) -> None:
         self._policy = ves_stark.Policy.aml_threshold(POLICY_THRESHOLD)
@@ -140,14 +228,12 @@ class MetricImprovementProver:
         best_reward: float,
         experiment_id: str,
         agent_id: str,
+        config_hash: str,
     ) -> MetricImprovementProof:
         """
         Generate a STARK proof that new_reward > best_reward.
 
-        The witness (improvement delta) is private; the proof is publicly
-        verifiable without knowing the exact new reward.
-
-        Raises ValueError if new_reward <= best_reward (proof is impossible).
+        Raises ValueError if new_reward <= best_reward at the circuit scale.
         """
         new_scaled = _reward_to_scaled(new_reward)
         best_scaled = _reward_to_scaled(best_reward)
@@ -158,29 +244,36 @@ class MetricImprovementProver:
                 f"<= best ({best_reward:.6f})"
             )
 
-        # The witness: how much the metric improved (private).
         delta = new_scaled - best_scaled
 
         self._sequence += 1
-        public_inputs = _make_public_inputs(
+        public_inputs, amount_binding = _make_amount_bound_public_inputs(
             experiment_id=experiment_id,
             agent_id=agent_id,
             sequence_number=self._sequence,
             policy_hash=self._policy_hash,
+            config_hash=config_hash,
+            best_reward_scaled=best_scaled,
+            new_reward_scaled=new_scaled,
+            improvement_delta_scaled=delta,
         )
 
-        # Generate the STARK proof via ves_stark.
         proof = ves_stark.prove(delta, public_inputs, self._policy)
 
         return MetricImprovementProof(
             experiment_id=experiment_id,
             agent_id=agent_id,
+            sequence_number=self._sequence,
+            config_hash=config_hash,
             best_reward_scaled=best_scaled,
+            new_reward_scaled=new_scaled,
+            improvement_delta_scaled=delta,
             proof_bytes=bytes(proof.proof_bytes),
             proof_hash=proof.proof_hash,
             witness_commitment=list(proof.witness_commitment),
             witness_commitment_hex=proof.witness_commitment_hex,
             policy_hash=self._policy_hash,
+            amount_binding_hash=amount_binding["bindingHash"],
             proving_time_ms=proof.proving_time_ms,
             proof_size=proof.proof_size,
             timestamp=time.time(),
@@ -190,12 +283,14 @@ class MetricImprovementProver:
 def verify_improvement(
     proof: MetricImprovementProof,
     claimed_best_reward: float,
+    claimed_new_reward: float | None = None,
+    config_hash: str | None = None,
 ) -> tuple[bool, str]:
     """
     Verify a STARK metric-improvement proof.
 
-    Returns (valid, message). Verification is fast (~milliseconds) and does
-    NOT require re-running the experiment.
+    If claimed_new_reward and/or config_hash are supplied, the verifier also
+    checks that the proof matches the caller's specific submission metadata.
     """
     expected_best_scaled = _reward_to_scaled(claimed_best_reward)
     if proof.best_reward_scaled != expected_best_scaled:
@@ -204,33 +299,60 @@ def verify_improvement(
             f"expected {expected_best_scaled}"
         )
 
-    # Reconstruct public inputs for verification.
+    if claimed_new_reward is not None:
+        expected_new_scaled = _reward_to_scaled(claimed_new_reward)
+        if proof.new_reward_scaled != expected_new_scaled:
+            return False, (
+                f"New-reward mismatch: proof claims {proof.new_reward_scaled}, "
+                f"expected {expected_new_scaled}"
+            )
+
+    if config_hash is not None and proof.config_hash != config_hash:
+        return False, "Config hash mismatch"
+
+    if proof.sequence_number < 1:
+        return False, "Invalid sequence number"
+
+    if proof.new_reward_scaled <= proof.best_reward_scaled:
+        return False, "Proof does not encode a positive improvement"
+
+    expected_delta = proof.new_reward_scaled - proof.best_reward_scaled
+    if proof.improvement_delta_scaled != expected_delta:
+        return False, (
+            f"Improvement mismatch: proof claims {proof.improvement_delta_scaled}, "
+            f"expected {expected_delta}"
+        )
+
     policy_hash = ves_stark.compute_policy_hash(
         POLICY_ID, {"threshold": POLICY_THRESHOLD}
     )
     if proof.policy_hash != policy_hash:
-        return False, f"Policy hash mismatch"
+        return False, "Policy hash mismatch"
 
-    public_inputs = _make_public_inputs(
+    public_inputs, amount_binding = _make_amount_bound_public_inputs(
         experiment_id=proof.experiment_id,
         agent_id=proof.agent_id,
-        sequence_number=1,  # verifier reconstructs from metadata
+        sequence_number=proof.sequence_number,
         policy_hash=policy_hash,
+        config_hash=proof.config_hash,
+        best_reward_scaled=proof.best_reward_scaled,
+        new_reward_scaled=proof.new_reward_scaled,
+        improvement_delta_scaled=proof.improvement_delta_scaled,
     )
+    if proof.amount_binding_hash != amount_binding["bindingHash"]:
+        return False, "Amount binding hash mismatch"
 
-    # Verify the STARK proof — this is the fast path.
     try:
-        result = ves_stark.verify(
+        result = ves_stark.verify_with_amount_binding(
             proof.proof_bytes,
             public_inputs,
-            proof.witness_commitment,
+            amount_binding,
         )
         if result.valid:
             return True, (
                 f"STARK proof valid (verified in {result.verification_time_ms}ms, "
                 f"proof size {proof.proof_size} bytes)"
             )
-        else:
-            return False, f"STARK verification failed: {result.error}"
-    except Exception as e:
-        return False, f"Verification error: {e}"
+        return False, f"STARK verification failed: {result.error}"
+    except Exception as exc:
+        return False, f"Verification error: {exc}"

@@ -12,6 +12,7 @@ Usage:
     python run_network.py --agents 8 --experiments 50
     python run_network.py --initial-best 0.523     # Start from current best
     python run_network.py --strategy adaptive      # All agents use adaptive strategy
+    python run_network.py --seed 42                # Reproducible search trajectory
     python run_network.py --export results.json    # Export results
 """
 
@@ -23,7 +24,6 @@ import time
 
 from stark_autoresearch.agent import AutoResearchAgent
 from stark_autoresearch.coordinator import NetworkCoordinator
-from stark_autoresearch.experiment import ExperimentConfig
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +39,8 @@ async def run_network(
     initial_best: float = 0.0,
     strategies: list[str] | None = None,
     export_path: str | None = None,
-) -> None:
+    seed: int | None = None,
+) -> tuple[NetworkCoordinator, list[AutoResearchAgent]]:
     """Run the decentralized STARK-verified autoresearch network."""
 
     print("=" * 70)
@@ -50,6 +51,8 @@ async def run_network(
     print(f"  Experiments/agent:   {experiments_per_agent}")
     print(f"  Initial best reward: {initial_best:.6f}")
     print(f"  Total experiments:   {num_agents * experiments_per_agent}")
+    if seed is not None:
+        print(f"  Seed:                {seed}")
     print()
 
     # ── Create coordinator ──
@@ -66,6 +69,7 @@ async def run_network(
         agent = AutoResearchAgent(
             agent_id=f"agent-{i:02d}",
             strategy=strategies[i],
+            seed=seed,
         )
         coordinator.register_agent(agent)
         agents.append(agent)
@@ -135,6 +139,7 @@ async def run_network(
         print(f"\n  Results exported to {export_path}")
 
     print()
+    return coordinator, agents
 
 
 def main() -> None:
@@ -162,6 +167,10 @@ def main() -> None:
         "--export", type=str, default=None,
         help="Export results to JSON file",
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Seed for reproducible experiment proposals and rewards",
+    )
 
     args = parser.parse_args()
 
@@ -175,6 +184,7 @@ def main() -> None:
         initial_best=args.initial_best,
         strategies=strategies,
         export_path=args.export,
+        seed=args.seed,
     ))
 
 

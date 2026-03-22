@@ -3,10 +3,10 @@ Network coordinator for the decentralized autoresearch network.
 
 Responsibilities:
 - Maintains global best reward and configuration.
-- Receives experiment submissions + STARK proofs from agents.
-- Verifies proofs cryptographically (fast, no re-running experiments).
-- Broadcasts verified improvements to all agents.
-- Tracks full history of verified experiments.
+- Receives experiment submissions and STARK proofs from agents.
+- Verifies proofs cryptographically without re-running experiments.
+- Broadcasts verified improvements to all other agents.
+- Tracks the history of verified experiments.
 """
 
 from __future__ import annotations
@@ -15,12 +15,16 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from stark_autoresearch.experiment import ExperimentConfig, ExperimentResult
-from stark_autoresearch.proof import MetricImprovementProof, verify_improvement
+from stark_autoresearch.proof import (
+    MetricImprovementProof,
+    canonicalize_reward,
+    verify_improvement,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class VerifiedExperiment:
     """An experiment whose improvement has been cryptographically verified."""
+
     result: ExperimentResult
     proof: MetricImprovementProof
     verification_time_ms: float
@@ -39,12 +44,12 @@ class NetworkCoordinator:
     Central coordinator for the STARK-verified autoresearch network.
 
     In a fully decentralized version, this would be replaced by a consensus
-    protocol (e.g., on-chain). This implementation simulates the coordinator
-    role for demonstration.
+    protocol. This implementation simulates the coordinator role for a local
+    demo while enforcing the proof/result consistency checks that matter here.
     """
 
     def __init__(self, initial_best_reward: float = 0.0) -> None:
-        self.best_reward: float = initial_best_reward
+        self.best_reward: float = canonicalize_reward(initial_best_reward)
         self.best_config: ExperimentConfig = ExperimentConfig.from_baseline()
         self.best_experiment: ExperimentResult | None = None
 
@@ -55,7 +60,6 @@ class NetworkCoordinator:
         self._agents: list[Any] = []
         self._lock = asyncio.Lock()
 
-        # Stats
         self.total_proving_time_ms: int = 0
         self.total_verification_time_ms: float = 0
         self.total_proof_bytes: int = 0
@@ -70,7 +74,8 @@ class NetworkCoordinator:
         )
         logger.info(
             "Registered %s (starting best=%.6f)",
-            agent.agent_id, self.best_reward,
+            agent.agent_id,
+            self.best_reward,
         )
 
     async def submit(
@@ -79,64 +84,85 @@ class NetworkCoordinator:
         """
         Submit an experiment result with its STARK proof.
 
-        The coordinator verifies the proof cryptographically. If valid and
-        the metric improves on the global best, the improvement is accepted
-        and broadcast to all agents.
-
         Returns True if accepted, False if rejected.
         """
         async with self._lock:
             self.total_submissions += 1
 
-            # Verify the STARK proof.
-            valid, message = verify_improvement(proof, self.best_reward)
+            if result.experiment_id != proof.experiment_id:
+                self.rejected_count += 1
+                logger.warning(
+                    "REJECTED submission from %s: experiment_id mismatch",
+                    result.agent_id,
+                )
+                return False
 
+            if result.agent_id != proof.agent_id:
+                self.rejected_count += 1
+                logger.warning(
+                    "REJECTED submission from %s: agent_id mismatch",
+                    result.agent_id,
+                )
+                return False
+
+            result_config_hash = result.config.content_hash()
+            valid, message = verify_improvement(
+                proof,
+                self.best_reward,
+                claimed_new_reward=result.avg_reward,
+                config_hash=result_config_hash,
+            )
             if not valid:
                 self.rejected_count += 1
                 logger.warning(
                     "REJECTED submission from %s: %s",
-                    result.agent_id, message,
+                    result.agent_id,
+                    message,
                 )
                 return False
 
-            # Check that the claimed improvement is actually over current best.
-            if result.avg_reward <= self.best_reward:
+            verified_reward = proof.new_reward
+            if verified_reward <= self.best_reward:
                 self.rejected_count += 1
                 logger.warning(
                     "REJECTED: reward %.6f not better than global best %.6f",
-                    result.avg_reward, self.best_reward,
+                    verified_reward,
+                    self.best_reward,
                 )
                 return False
 
-            # Accept the verified improvement.
-            v_time_ms = float(message.split("verified in ")[1].split("ms")[0]) if "verified in" in message else 0
+            canonical_result = replace(result, avg_reward=verified_reward)
+            v_time_ms = (
+                float(message.split("verified in ")[1].split("ms")[0])
+                if "verified in" in message
+                else 0.0
+            )
             verified = VerifiedExperiment(
-                result=result,
+                result=canonical_result,
                 proof=proof,
                 verification_time_ms=v_time_ms,
             )
             self.verified_experiments.append(verified)
 
-            # Update global best.
             old_best = self.best_reward
-            self.best_reward = result.avg_reward
-            self.best_config = result.config
-            self.best_experiment = result
+            self.best_reward = verified_reward
+            self.best_config = canonical_result.config
+            self.best_experiment = canonical_result
 
-            # Accumulate stats.
             self.total_proving_time_ms += proof.proving_time_ms
             self.total_verification_time_ms += v_time_ms
             self.total_proof_bytes += proof.proof_size
 
             logger.info(
                 "VERIFIED improvement: %.6f → %.6f by %s (%s)",
-                old_best, result.avg_reward,
-                result.agent_id, message,
+                old_best,
+                verified_reward,
+                canonical_result.agent_id,
+                message,
             )
 
-            # Broadcast to all agents.
             for agent in self._agents:
-                if agent.agent_id != result.agent_id:
+                if agent.agent_id != canonical_result.agent_id:
                     agent.update_from_network(self.best_reward, self.best_config)
 
             return True
@@ -187,7 +213,7 @@ class NetworkCoordinator:
 
         if self.verified_experiments:
             print(f"\n  {'─' * 66}")
-            print(f"  VERIFIED IMPROVEMENT TRAJECTORY (STARK-proven)")
+            print("  VERIFIED IMPROVEMENT TRAJECTORY (STARK-proven)")
             print(f"  {'─' * 66}")
             for i, ve in enumerate(self.verified_experiments):
                 print(

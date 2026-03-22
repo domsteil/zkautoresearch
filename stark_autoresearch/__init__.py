@@ -1,33 +1,52 @@
-"""
-Decentralized Autoresearch Network with STARK Proofs
-=====================================================
+"""Decentralized autoresearch network with STARK-backed proof verification."""
 
-Multiple autoresearch agents run in parallel, each optimizing hyperparameters.
-Every improvement is cryptographically verified via a STARK proof generated
-from the stateset-stark library — no need to re-run experiments to trust results.
+from __future__ import annotations
 
-Modules:
-    proof       — STARK proof generation/verification for metric improvement
-    experiment  — Experiment data structures and config perturbation
-    agent       — Individual autoresearch agent with proof generation
-    coordinator — Network coordinator: proof verification, global state, broadcasting
-"""
-
-from stark_autoresearch.proof import (
-    MetricImprovementProver,
-    MetricImprovementProof,
-    verify_improvement,
-)
-from stark_autoresearch.experiment import ExperimentResult, ExperimentConfig
-from stark_autoresearch.agent import AutoResearchAgent
-from stark_autoresearch.coordinator import NetworkCoordinator
+from importlib import import_module
+from typing import Any
 
 __all__ = [
-    "MetricImprovementProver",
-    "MetricImprovementProof",
-    "verify_improvement",
-    "ExperimentResult",
-    "ExperimentConfig",
     "AutoResearchAgent",
+    "DependencyStatus",
+    "EnvironmentReport",
+    "ExperimentConfig",
+    "ExperimentResult",
+    "MetricImprovementProof",
+    "MetricImprovementProver",
     "NetworkCoordinator",
+    "build_environment_report",
+    "format_environment_report",
+    "inspect_ves_stark",
+    "verify_improvement",
 ]
+
+_LAZY_EXPORTS = {
+    "AutoResearchAgent": ("stark_autoresearch.agent", "AutoResearchAgent"),
+    "DependencyStatus": ("stark_autoresearch.environment", "DependencyStatus"),
+    "EnvironmentReport": ("stark_autoresearch.environment", "EnvironmentReport"),
+    "ExperimentConfig": ("stark_autoresearch.experiment", "ExperimentConfig"),
+    "ExperimentResult": ("stark_autoresearch.experiment", "ExperimentResult"),
+    "MetricImprovementProof": ("stark_autoresearch.proof", "MetricImprovementProof"),
+    "MetricImprovementProver": ("stark_autoresearch.proof", "MetricImprovementProver"),
+    "NetworkCoordinator": ("stark_autoresearch.coordinator", "NetworkCoordinator"),
+    "build_environment_report": ("stark_autoresearch.environment", "build_environment_report"),
+    "format_environment_report": ("stark_autoresearch.environment", "format_environment_report"),
+    "inspect_ves_stark": ("stark_autoresearch.environment", "inspect_ves_stark"),
+    "verify_improvement": ("stark_autoresearch.proof", "verify_improvement"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    try:
+        module_name, attr_name = _LAZY_EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))

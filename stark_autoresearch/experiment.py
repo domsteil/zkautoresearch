@@ -13,6 +13,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+RandomSource = random.Random
+
 
 # Default baseline hyperparameters (matches current best: commit dbe3c69)
 BASELINE_PARAMS: dict[str, Any] = {
@@ -86,6 +88,7 @@ class ExperimentResult:
             "experiment_id": self.experiment_id,
             "agent_id": self.agent_id,
             "config": self.config.params,
+            "config_hash": self.config.content_hash(),
             "description": self.config.description,
             "avg_reward": self.avg_reward,
             "reward_std": self.reward_std,
@@ -100,10 +103,12 @@ def perturb_config(
     base: ExperimentConfig,
     num_params: int = 2,
     magnitude: float = 0.3,
+    rng: RandomSource | None = None,
 ) -> ExperimentConfig:
     """Create a new config by randomly perturbing `num_params` parameters."""
+    rng = rng or random
     params = copy.deepcopy(base.params)
-    keys = random.sample(list(SEARCH_RANGES.keys()), min(num_params, len(SEARCH_RANGES)))
+    keys = rng.sample(list(SEARCH_RANGES.keys()), min(num_params, len(SEARCH_RANGES)))
     changes = []
 
     for key in keys:
@@ -114,24 +119,24 @@ def perturb_config(
             import math
             log_val = math.log(old_val) if old_val > 0 else math.log(spec["low"])
             log_range = math.log(spec["high"]) - math.log(spec["low"])
-            new_log = log_val + random.gauss(0, magnitude * log_range)
+            new_log = log_val + rng.gauss(0, magnitude * log_range)
             new_val = max(spec["low"], min(spec["high"], math.exp(new_log)))
             params[key] = new_val
 
         elif spec["type"] == "float":
             span = spec["high"] - spec["low"]
-            new_val = old_val + random.gauss(0, magnitude * span)
+            new_val = old_val + rng.gauss(0, magnitude * span)
             new_val = max(spec["low"], min(spec["high"], new_val))
             params[key] = new_val
 
         elif spec["type"] == "int":
             delta = max(1, int(magnitude * (spec["high"] - spec["low"])))
-            new_val = old_val + random.randint(-delta, delta)
+            new_val = old_val + rng.randint(-delta, delta)
             new_val = max(spec["low"], min(spec["high"], new_val))
             params[key] = new_val
 
         elif spec["type"] == "choice":
-            params[key] = random.choice(spec["values"])
+            params[key] = rng.choice(spec["values"])
 
         changes.append(f"{key}={params[key]}")
 

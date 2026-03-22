@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+      - name: Run packaging and dependency-light tests
+        run: python -m pytest -q
+
+  integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+          python -m pip install --upgrade maturin
+      - name: Build ves_stark bindings
+        run: |
+          git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          python scripts/install_ves_stark.py --stateset-stark-dir ../stateset-stark --skip-pip-upgrade
+      - name: Run full test suite
+        run: python -m pytest -q

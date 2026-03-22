@@ -8,3 +8,10 @@ dependencies = []
 
 [project.scripts]
 zkautoresearch = "run_network:main"
+zkautoresearch-doctor = "stark_autoresearch.environment:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
