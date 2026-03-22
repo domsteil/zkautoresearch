@@ -1,0 +1,10 @@
+[project]
+name = "zkautoresearch"
+version = "0.1.0"
+description = "Decentralized autoresearch network with STARK cryptographic verification"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = []
+
+[project.scripts]
+zkautoresearch = "run_network:main"
