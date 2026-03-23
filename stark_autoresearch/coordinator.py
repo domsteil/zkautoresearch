@@ -105,19 +105,33 @@ class NetworkCoordinator:
                 )
                 return False
 
+            if (
+                result.envelope_sha256 is not None
+                and proof.envelope_sha256 is not None
+                and result.envelope_sha256 != proof.envelope_sha256
+            ):
+                self.rejected_count += 1
+                logger.warning(
+                    "REJECTED submission from %s: envelope_sha256 mismatch",
+                    result.agent_id,
+                )
+                return False
+
             result_config_hash = result.config.content_hash()
-            valid, message = verify_improvement(
+            verification = verify_improvement(
                 proof,
                 self.best_reward,
-                claimed_new_reward=result.avg_reward,
-                config_hash=result_config_hash,
+                claimed_new_reward=None if result.provenance_path else result.avg_reward,
+                config_hash=None if result.provenance_path else result_config_hash,
+                provenance_path=result.provenance_path,
+                require_provenance_signature=result.provenance_path is not None,
             )
-            if not valid:
+            if not verification.valid:
                 self.rejected_count += 1
                 logger.warning(
                     "REJECTED submission from %s: %s",
                     result.agent_id,
-                    message,
+                    verification.message,
                 )
                 return False
 
@@ -132,15 +146,10 @@ class NetworkCoordinator:
                 return False
 
             canonical_result = replace(result, avg_reward=verified_reward)
-            v_time_ms = (
-                float(message.split("verified in ")[1].split("ms")[0])
-                if "verified in" in message
-                else 0.0
-            )
             verified = VerifiedExperiment(
                 result=canonical_result,
                 proof=proof,
-                verification_time_ms=v_time_ms,
+                verification_time_ms=verification.verification_time_ms,
             )
             self.verified_experiments.append(verified)
 
@@ -150,7 +159,7 @@ class NetworkCoordinator:
             self.best_experiment = canonical_result
 
             self.total_proving_time_ms += proof.proving_time_ms
-            self.total_verification_time_ms += v_time_ms
+            self.total_verification_time_ms += verification.verification_time_ms
             self.total_proof_bytes += proof.proof_size
 
             logger.info(
@@ -158,7 +167,7 @@ class NetworkCoordinator:
                 old_best,
                 verified_reward,
                 canonical_result.agent_id,
-                message,
+                verification.message,
             )
 
             for agent in self._agents:

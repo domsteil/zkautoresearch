@@ -1,101 +1,79 @@
 # zkautoresearch
 
-Decentralized autoresearch network with STARK cryptographic verification.
+STARK-verified autonomous research for `stateset-agents`.
 
-Multiple autoresearch agents run in parallel optimizing hyperparameters. Every accepted metric improvement is proven via a STARK proof that is bound to the experiment metadata, config hash, baseline, claimed reward, and improvement delta, so verifiers can confirm results without re-running experiments.
+This repo now combines two related pieces of work:
 
-## How it works
+- `auto_research.py`: a subprocess-backed autonomous RL experiment runner with hard time budgets, resumable runs, runtime fingerprints, signed provenance, STARK proof emission for real improvements, audit reports, best-artifact repair, and append-only repair history.
+- `run_network.py` plus `stark_autoresearch/`: the decentralized multi-agent demo that submits proof-backed improvements to a coordinator without rerunning experiments.
 
-1. **Parallel agents** each propose and run hyperparameter experiments
-2. **When a metric improves**, the agent encodes `delta = (new_reward - best_reward) × 1,000,000` as a u64 and generates a STARK proof that `delta < 1,000,000` using the [stateset-stark](https://github.com/stateset/stateset-stark) circuit
-3. **The proof payload binds** the experiment id, agent id, config hash, baseline reward, claimed new reward, sequence number, and canonical amount binding for `delta`
-4. **The coordinator verifies proofs** in <1ms without re-running any training, and rejects mismatched rewards/configs before accepting an update
-5. **Verified improvements are broadcast** to all agents, who update their baselines and learn
+## Main workflows
 
-## Performance
+### 1. Autonomous research runner
 
-| Metric | Value |
-|---|---|
-| Proof size | ~75 KB |
-| Proving time | ~30ms |
-| Verification time | <1ms |
-| Throughput | ~40 experiments/sec (6 agents) |
+```bash
+uv sync
+python auto_research.py --runtime-profile smoke --max-experiments 2 --time-budget 60
+python auto_research.py --analyze --output-dir ./auto_research_results
+python auto_research.py --audit-run ./auto_research_results --require-signature
+python auto_research.py --repair-best-artifacts ./auto_research_results --require-signature
+```
 
-## Usage
+Useful verification commands:
 
-Requires `ves_stark` Python bindings built from [stateset-stark](https://github.com/stateset/stateset-stark).
+```bash
+python auto_research.py --verify-provenance ./auto_research_results --require-signature
+python auto_research.py --verify-proof ./auto_research_results --require-signature
+python auto_research.py --verify-repair-report ./auto_research_results --require-signature
+python auto_research.py --verify-repair-history ./auto_research_results --require-signature
+```
 
-Inspect the current environment:
+The runner operates on the fixed evaluation harness in `prepare.py` and the editable training entrypoint in `train.py`. Results are written under `auto_research_results/` with per-run summaries, provenance envelopes, proof artifacts, `audit_report.json`, `attestation_summary.json`, `repair_report.json`, and `repair_history/repair_*.json`.
+
+### 2. Decentralized network demo
+
+```bash
+python run_network.py --agents 2 --experiments 5 --seed 42
+python run_network.py --agents 4 --experiments 20 --export results.json
+```
+
+This path keeps the original STARK-backed coordinator demo and reproducibility tests intact.
+
+## Environment
+
+The repo expects local checkouts of:
+
+- `../stateset-agents`
+- `../icommerce-app/stateset-stark/crates/ves-stark-python`
+
+Dependency status can be checked with:
 
 ```bash
 python -m stark_autoresearch.environment
 zkautoresearch-doctor
 ```
 
-Install the bindings from a local checkout of `stateset-stark`:
-
-```bash
-python scripts/install_ves_stark.py --stateset-stark-dir /path/to/stateset-stark
-make install-ves-stark STATESET_STARK_DIR=/path/to/stateset-stark
-```
-
-Run the network:
-
-```bash
-python run_network.py                                    # 4 agents, 20 experiments each
-python run_network.py --agents 8 --experiments 50        # scale up
-python run_network.py --initial-best 0.523               # start from a baseline
-python run_network.py --strategy adaptive                # all agents use adaptive
-python run_network.py --seed 42                          # reproducible search trajectory
-python run_network.py --export results.json              # export results
-```
-
-Run integrity tests:
+## Tests
 
 ```bash
 python -m pytest -q
-python test_stark_integrity.py
-make test
+make test-core
+make test-autoresearch
+make demo-seeded
 ```
 
-## Automation
+## Layout
 
-- `make doctor` prints the current dependency status
-- `make test` runs the full test suite
-- `make demo-seeded` runs a reproducible demo trajectory
-- `.github/workflows/ci.yml` runs a dependency-light packaging job and a full `ves_stark` integration job
-
-## Reproducibility
-
-- Use `--seed` to make agent proposals, synthetic rewards, and experiment ids deterministic across runs
-- The exported proof metadata includes config hashes and sequence numbers so accepted trajectories can be audited
-
-## Architecture
-
+```text
+stark_autoresearch/          STARK proof, agent, coordinator, environment code
+auto_research.py             Main CLI for autonomous research / audit / repair
+subprocess_auto_research.py  Subprocess experiment runner
+attestation_audit.py         Provenance, proof, best-artifact, and repair verification
+experiment_runtime.py        Runtime detection, hashing, signing, provenance helpers
+prepare.py                   Locked evaluation harness and scenarios
+train.py                     Single experiment entrypoint
+program.md                   Human/agent operating instructions
 ```
-stark_autoresearch/
-├── proof.py         — STARK proof generation/verification for metric improvement
-├── experiment.py    — Experiment configs + hyperparameter perturbation
-├── agent.py         — Parallel agent with adaptive self-learning strategy
-├── coordinator.py   — Network coordinator: proof verification + broadcasting
-├── environment.py   — Dependency doctor / runtime environment checks
-└── __init__.py
-
-scripts/install_ves_stark.py  — Install the local ves_stark bindings
-run_network.py                — Run the decentralized network
-test_stark_integrity.py       — Cryptographic soundness tests
-test_environment.py           — Packaging / dependency-light tests
-test_network_behavior.py      — Reproducibility + export regression tests
-```
-
-## STARK integrity guarantees
-
-- **Valid proofs verify** — genuine improvements are accepted
-- **Tampered proofs are rejected** — verification fails on altered bytes
-- **Non-improvements can't generate proofs** — the circuit is unsatisfiable
-- **Wrong baselines or claimed rewards are rejected** — proof-bound scaled values must match the submission
-- **Config mismatches are rejected** — the proof is tied to the experiment's config hash
-- **Later proofs remain verifiable** — sequence numbers are part of the bound public inputs
 
 ## License
 

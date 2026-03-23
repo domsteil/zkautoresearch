@@ -1,0 +1,45 @@
+# Auto-Research Configuration for stateset-agents
+# ================================================
+#
+# Usage: uv run auto_research.py --config auto_research_config.yaml
+#
+# This overrides the defaults in auto_research.py.
+# CLI flags override this file.
+
+# Model
+model_name: "Qwen/Qwen3.5-0.8B"
+system_prompt: >
+  You are an expert customer service agent. Follow these rules strictly:
+  1) Greet the customer warmly.
+  2) Acknowledge their issue with empathy.
+  3) Ask clarifying questions.
+  4) Provide a clear solution or next steps.
+  5) Confirm resolution.
+  Always be polite, professional, and concise.
+max_new_tokens: 64
+reward_domain: "customer_service"
+
+# Hardware
+use_gpu: null        # null = auto-detect, true = require GPU, false = force CPU
+bf16: false          # Set true for bfloat16 on GPU
+gradient_checkpointing: false
+
+# Evaluation
+eval_episodes: 4
+
+# Starting hyperparameters (the auto-research loop perturbs these)
+baseline_params:
+  learning_rate: 5e-6
+  num_generations: 2
+  num_outer_iterations: 1
+  generations_per_iteration: 3
+  clip_range_left: 3e-4
+  clip_range_right: 4e-4
+  lora_r: 4
+  lora_alpha: 8
+  lora_dropout: 0.05
+  temperature: 0.5
+  top_p: 0.9
+  warmup_ratio: 0.1
+  entropy_coef: 0.01
+  beta: 0.0

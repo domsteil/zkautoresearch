@@ -1,13 +1,24 @@
 [project]
 name = "zkautoresearch"
 version = "0.1.0"
-description = "Decentralized autoresearch network with STARK cryptographic verification"
+description = "STARK-verified autonomous research runner and decentralized network demo"
+readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "numpy>=2.2.6",
+    "torch==2.9.1",
+    "transformers",
+    "accelerate>=0.20.0",
+    "peft>=0.4.0",
+    "psutil>=5.9.0",
+    "stateset-agents[auto-research]",
+    "ves-stark",
+]
 
 [project.scripts]
 zkautoresearch = "run_network:main"
+zkautoresearch-auto = "auto_research:main"
 zkautoresearch-doctor = "stark_autoresearch.environment:main"
 
 [project.optional-dependencies]
@@ -15,3 +26,16 @@ dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128" },
+]
+transformers = { git = "https://github.com/huggingface/transformers.git" }
+stateset-agents = { path = "../stateset-agents", editable = true }
+ves-stark = { path = "../icommerce-app/stateset-stark/crates/ves-stark-python" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

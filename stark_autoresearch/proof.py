@@ -14,6 +14,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 try:
@@ -37,48 +38,76 @@ POLICY_THRESHOLD = SCALE_FACTOR
 
 
 @dataclass
+class VerificationResult:
+    """Structured proof verification result."""
+
+    valid: bool
+    message: str
+    verification_time_ms: float = 0.0
+
+    def __iter__(self):
+        yield self.valid
+        yield self.message
+
+    def __bool__(self) -> bool:
+        return self.valid
+
+
+@dataclass
 class MetricImprovementProof:
     """A STARK proof that an experiment's metric improved over the previous best."""
 
     experiment_id: str
     agent_id: str
-    sequence_number: int
-    config_hash: str
     best_reward_scaled: int
-    new_reward_scaled: int
-    improvement_delta_scaled: int
+    sequence_number: int
     proof_bytes: bytes
     proof_hash: str
     witness_commitment: list[int]
     witness_commitment_hex: str
     policy_hash: str
-    amount_binding_hash: str
     proving_time_ms: int
     proof_size: int
     timestamp: float
+    config_hash: str | None = None
+    new_reward_scaled: int | None = None
+    improvement_delta_scaled: int | None = None
+    envelope_sha256: str | None = None
+    amount_binding_hash: str | None = None
 
     @property
     def new_reward(self) -> float:
         """Canonical float reward implied by the proof metadata."""
-        return _scaled_to_reward(self.new_reward_scaled)
+        if self.new_reward_scaled is not None:
+            return _scaled_to_reward(self.new_reward_scaled)
+        if self.improvement_delta_scaled is not None:
+            return _scaled_to_reward(self.best_reward_scaled + self.improvement_delta_scaled)
+        return _scaled_to_reward(self.best_reward_scaled)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "experiment_id": self.experiment_id,
             "agent_id": self.agent_id,
             "sequence_number": self.sequence_number,
-            "config_hash": self.config_hash,
             "best_reward_scaled": self.best_reward_scaled,
-            "new_reward_scaled": self.new_reward_scaled,
-            "improvement_delta_scaled": self.improvement_delta_scaled,
             "proof_hash": self.proof_hash,
             "witness_commitment_hex": self.witness_commitment_hex,
             "policy_hash": self.policy_hash,
-            "amount_binding_hash": self.amount_binding_hash,
             "proving_time_ms": self.proving_time_ms,
             "proof_size": self.proof_size,
             "timestamp": self.timestamp,
         }
+        if self.config_hash is not None:
+            payload["config_hash"] = self.config_hash
+        if self.new_reward_scaled is not None:
+            payload["new_reward_scaled"] = self.new_reward_scaled
+        if self.improvement_delta_scaled is not None:
+            payload["improvement_delta_scaled"] = self.improvement_delta_scaled
+        if self.envelope_sha256 is not None:
+            payload["envelope_sha256"] = self.envelope_sha256
+        if self.amount_binding_hash is not None:
+            payload["amount_binding_hash"] = self.amount_binding_hash
+        return payload
 
 
 def _reward_to_scaled(reward: float) -> int:
@@ -94,6 +123,10 @@ def _scaled_to_reward(scaled_reward: int) -> float:
 def canonicalize_reward(reward: float) -> float:
     """Round-trip a reward through the circuit scale factor."""
     return _scaled_to_reward(_reward_to_scaled(reward))
+
+
+def _normalized_config_hash(config_hash: str | None) -> str:
+    return "" if config_hash is None else str(config_hash)
 
 
 def _payload_hashes(
@@ -212,6 +245,13 @@ def _is_valid_uuid(value: str) -> bool:
         return False
 
 
+def _load_json_object(path: str | Path) -> dict[str, Any]:
+    payload = json.loads(Path(path).read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object at {path}")
+    return payload
+
+
 class MetricImprovementProver:
     """Generate STARK proofs that a new metric exceeds the current best."""
 
@@ -228,7 +268,8 @@ class MetricImprovementProver:
         best_reward: float,
         experiment_id: str,
         agent_id: str,
-        config_hash: str,
+        config_hash: str | None = None,
+        envelope_sha256: str | None = None,
     ) -> MetricImprovementProof:
         """
         Generate a STARK proof that new_reward > best_reward.
@@ -247,12 +288,13 @@ class MetricImprovementProver:
         delta = new_scaled - best_scaled
 
         self._sequence += 1
+        normalized_config_hash = _normalized_config_hash(config_hash)
         public_inputs, amount_binding = _make_amount_bound_public_inputs(
             experiment_id=experiment_id,
             agent_id=agent_id,
             sequence_number=self._sequence,
             policy_hash=self._policy_hash,
-            config_hash=config_hash,
+            config_hash=normalized_config_hash,
             best_reward_scaled=best_scaled,
             new_reward_scaled=new_scaled,
             improvement_delta_scaled=delta,
@@ -277,6 +319,44 @@ class MetricImprovementProver:
             proving_time_ms=proof.proving_time_ms,
             proof_size=proof.proof_size,
             timestamp=time.time(),
+            envelope_sha256=envelope_sha256,
+        )
+
+    def prove_improvement_from_provenance(
+        self,
+        *,
+        provenance_path: str | Path,
+        best_reward: float,
+        agent_id: str,
+        require_signature: bool,
+    ) -> MetricImprovementProof:
+        from experiment_runtime import verify_provenance_envelope
+
+        verification = verify_provenance_envelope(
+            provenance_path,
+            require_signature=require_signature,
+        )
+        if not verification.get("ok"):
+            reason = verification.get("signature_reason") or "provenance verification failed"
+            raise ValueError(f"Invalid provenance envelope: {reason}")
+
+        payload = _load_json_object(provenance_path)
+        try:
+            objective_value = float(payload["objective_value"])
+        except KeyError as exc:
+            raise ValueError(f"Provenance envelope missing objective_value: {provenance_path}") from exc
+
+        config_hash = payload.get("summary_config_sha256")
+        if config_hash is not None:
+            config_hash = str(config_hash)
+
+        return self.prove_improvement(
+            new_reward=objective_value,
+            best_reward=best_reward,
+            experiment_id=str(payload["experiment_id"]),
+            agent_id=agent_id,
+            config_hash=config_hash,
+            envelope_sha256=payload.get("envelope_sha256"),
         )
 
 
@@ -285,62 +365,104 @@ def verify_improvement(
     claimed_best_reward: float,
     claimed_new_reward: float | None = None,
     config_hash: str | None = None,
-) -> tuple[bool, str]:
+    provenance_path: str | Path | None = None,
+    require_provenance_signature: bool = False,
+) -> VerificationResult:
     """
     Verify a STARK metric-improvement proof.
 
     If claimed_new_reward and/or config_hash are supplied, the verifier also
     checks that the proof matches the caller's specific submission metadata.
+    When provenance_path is supplied, the proof can be bound to a signed
+    provenance envelope instead of an explicit claimed_new_reward.
     """
     expected_best_scaled = _reward_to_scaled(claimed_best_reward)
     if proof.best_reward_scaled != expected_best_scaled:
-        return False, (
-            f"Best-reward mismatch: proof claims {proof.best_reward_scaled}, "
-            f"expected {expected_best_scaled}"
+        return VerificationResult(
+            False,
+            f"Best-reward mismatch: proof claims {proof.best_reward_scaled}, expected {expected_best_scaled}",
         )
+
+    expected_new_scaled: int | None = None
+    inferred_config_hash: str | None = None
+    if provenance_path is not None:
+        from experiment_runtime import verify_provenance_envelope
+
+        provenance_verification = verify_provenance_envelope(
+            provenance_path,
+            require_signature=require_provenance_signature,
+        )
+        if not provenance_verification.get("ok"):
+            reason = provenance_verification.get("signature_reason") or "provenance verification failed"
+            return VerificationResult(False, f"Provenance verification failed: {reason}")
+
+        provenance_payload = _load_json_object(provenance_path)
+        if str(provenance_payload.get("experiment_id")) != proof.experiment_id:
+            return VerificationResult(False, "Experiment/provenance mismatch")
+        if proof.envelope_sha256 is not None and provenance_payload.get("envelope_sha256") != proof.envelope_sha256:
+            return VerificationResult(False, "Envelope SHA mismatch")
+        if "objective_value" not in provenance_payload:
+            return VerificationResult(False, "Provenance missing objective_value")
+        inferred_config_hash = provenance_payload.get("summary_config_sha256")
+        if inferred_config_hash is not None:
+            inferred_config_hash = str(inferred_config_hash)
+        expected_new_scaled = _reward_to_scaled(float(provenance_payload["objective_value"]))
 
     if claimed_new_reward is not None:
-        expected_new_scaled = _reward_to_scaled(claimed_new_reward)
-        if proof.new_reward_scaled != expected_new_scaled:
-            return False, (
-                f"New-reward mismatch: proof claims {proof.new_reward_scaled}, "
-                f"expected {expected_new_scaled}"
-            )
+        claimed_new_scaled = _reward_to_scaled(claimed_new_reward)
+        if expected_new_scaled is None:
+            expected_new_scaled = claimed_new_scaled
+        elif claimed_new_scaled != expected_new_scaled:
+            return VerificationResult(False, "Claimed reward/provenance mismatch")
 
-    if config_hash is not None and proof.config_hash != config_hash:
-        return False, "Config hash mismatch"
+    if expected_new_scaled is None:
+        if proof.new_reward_scaled is None:
+            return VerificationResult(False, "New reward unavailable for verification")
+        expected_new_scaled = int(proof.new_reward_scaled)
+
+    if proof.new_reward_scaled is not None and int(proof.new_reward_scaled) != expected_new_scaled:
+        return VerificationResult(
+            False,
+            f"New-reward mismatch: proof claims {proof.new_reward_scaled}, expected {expected_new_scaled}",
+        )
+
+    if expected_new_scaled <= proof.best_reward_scaled:
+        return VerificationResult(False, "Proof does not encode a positive improvement")
+
+    expected_delta = expected_new_scaled - proof.best_reward_scaled
+    if proof.improvement_delta_scaled is not None and int(proof.improvement_delta_scaled) != expected_delta:
+        return VerificationResult(
+            False,
+            f"Improvement mismatch: proof claims {proof.improvement_delta_scaled}, expected {expected_delta}",
+        )
+
+    effective_config_hash = proof.config_hash if proof.config_hash is not None else inferred_config_hash
+    normalized_proof_config_hash = _normalized_config_hash(effective_config_hash)
+    normalized_expected_config_hash = _normalized_config_hash(config_hash)
+    if config_hash is not None and normalized_proof_config_hash != normalized_expected_config_hash:
+        return VerificationResult(False, "Config hash mismatch")
 
     if proof.sequence_number < 1:
-        return False, "Invalid sequence number"
-
-    if proof.new_reward_scaled <= proof.best_reward_scaled:
-        return False, "Proof does not encode a positive improvement"
-
-    expected_delta = proof.new_reward_scaled - proof.best_reward_scaled
-    if proof.improvement_delta_scaled != expected_delta:
-        return False, (
-            f"Improvement mismatch: proof claims {proof.improvement_delta_scaled}, "
-            f"expected {expected_delta}"
-        )
+        return VerificationResult(False, "Invalid sequence number")
 
     policy_hash = ves_stark.compute_policy_hash(
         POLICY_ID, {"threshold": POLICY_THRESHOLD}
     )
     if proof.policy_hash != policy_hash:
-        return False, "Policy hash mismatch"
+        return VerificationResult(False, "Policy hash mismatch")
 
     public_inputs, amount_binding = _make_amount_bound_public_inputs(
         experiment_id=proof.experiment_id,
         agent_id=proof.agent_id,
         sequence_number=proof.sequence_number,
         policy_hash=policy_hash,
-        config_hash=proof.config_hash,
+        config_hash=normalized_proof_config_hash,
         best_reward_scaled=proof.best_reward_scaled,
-        new_reward_scaled=proof.new_reward_scaled,
-        improvement_delta_scaled=proof.improvement_delta_scaled,
+        new_reward_scaled=expected_new_scaled,
+        improvement_delta_scaled=expected_delta,
     )
-    if proof.amount_binding_hash != amount_binding["bindingHash"]:
-        return False, "Amount binding hash mismatch"
+    if proof.amount_binding_hash is not None and proof.amount_binding_hash != amount_binding["bindingHash"]:
+        return VerificationResult(False, "Amount binding hash mismatch")
 
     try:
         result = ves_stark.verify_with_amount_binding(
@@ -349,10 +471,11 @@ def verify_improvement(
             amount_binding,
         )
         if result.valid:
-            return True, (
-                f"STARK proof valid (verified in {result.verification_time_ms}ms, "
-                f"proof size {proof.proof_size} bytes)"
+            return VerificationResult(
+                True,
+                f"STARK proof valid (verified in {result.verification_time_ms}ms, proof size {proof.proof_size} bytes)",
+                verification_time_ms=float(result.verification_time_ms),
             )
-        return False, f"STARK verification failed: {result.error}"
+        return VerificationResult(False, f"STARK verification failed: {result.error}")
     except Exception as exc:
-        return False, f"Verification error: {exc}"
+        return VerificationResult(False, f"Verification error: {exc}")

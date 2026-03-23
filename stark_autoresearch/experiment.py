@@ -82,6 +82,8 @@ class ExperimentResult:
     training_seconds: float = 0.0
     timestamp: float = field(default_factory=time.time)
     commit_hash: str = ""
+    provenance_path: str | None = None
+    envelope_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +98,8 @@ class ExperimentResult:
             "training_seconds": self.training_seconds,
             "timestamp": self.timestamp,
             "commit_hash": self.commit_hash,
+            "provenance_path": self.provenance_path,
+            "envelope_sha256": self.envelope_sha256,
         }
 
 
